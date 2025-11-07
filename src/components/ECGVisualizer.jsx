@@ -20,6 +20,7 @@ export default function ECGVisualizer(){
   const [secondsWindow, setSecondsWindow] = useState(DEFAULT_SECONDS)
   const [inputUnits, setInputUnits] = useState('mv') // 'mv' | 'adc'
   const [filterOn, setFilterOn] = useState(true) // DSP bandpass (0.5–40 Hz)
+  const [advancedReport, setAdvancedReport] = useState(true)
 
   // Final Report Recording (15 seconds + 10s wait)
   const [isRecording, setIsRecording] = useState(false)
@@ -28,6 +29,7 @@ export default function ECGVisualizer(){
   const [waitProgress, setWaitProgress] = useState(0)
   const [showReport, setShowReport] = useState(false)
   const [recordedData, setRecordedData] = useState(null)
+  const [connectError, setConnectError] = useState(null)
   const reportCanvasRef = useRef(null)
 
   const leads = ['Lead I','Lead II','Lead III','aVR','aVL','aVF']
@@ -52,7 +54,11 @@ export default function ECGVisualizer(){
   const lpAlphaRef = useRef(0)
   // Recording via refs to avoid stale closures
   const recordRef = useRef({ active:false, data:null, count:0 })
+  const autoStopTriggeredRef = useRef(false)
+  const manualStopRef = useRef(false)
   const sampleRateRef = useRef(sampleRate)
+  const freezeDisplayRef = useRef(false)
+  const frozenBufferRef = useRef(null)
 
   // (re)initialize buffers when secondsWindow changes
   useEffect(()=>{
@@ -142,15 +148,23 @@ export default function ECGVisualizer(){
       const [leftLeadIdx, rightLeadIdx] = leadPairs[rowIdx]
       const halfW = w / 2
       
-      // Draw left lead (e.g., Lead I)
-      drawLeadTrace(ctx, leftLeadIdx, 0, halfW, h, samples, xStep, leads[leftLeadIdx])
-      
-      // Draw right lead (e.g., aVL)
-      drawLeadTrace(ctx, rightLeadIdx, halfW, halfW, h, samples, xStep, leads[rightLeadIdx])
+      // If display is frozen, draw from frozenBuffer snapshot; otherwise draw from live ring buffer
+      if (freezeDisplayRef.current && frozenBufferRef.current) {
+        const frozen = frozenBufferRef.current
+        drawLeadTrace(ctx, leftLeadIdx, 0, halfW, h, samples, xStep, leads[leftLeadIdx], frozen[leftLeadIdx])
+        drawLeadTrace(ctx, rightLeadIdx, halfW, halfW, h, samples, xStep, leads[rightLeadIdx], frozen[rightLeadIdx])
+      } else {
+        // Draw left lead (e.g., Lead I)
+        drawLeadTrace(ctx, leftLeadIdx, 0, halfW, h, samples, xStep, leads[leftLeadIdx])
+        
+        // Draw right lead (e.g., aVL)
+        drawLeadTrace(ctx, rightLeadIdx, halfW, halfW, h, samples, xStep, leads[rightLeadIdx])
+      }
     }
   }
 
-  function drawLeadTrace(ctx, leadIdx, xOffset, width, height, samples, xStep, leadName){
+  // samplesArr is an optional plain array used when drawing a frozen snapshot.
+  function drawLeadTrace(ctx, leadIdx, xOffset, width, height, samples, xStep, leadName, samplesArr){
     const baselineY = Math.floor(height/2)
     
     // midline
@@ -189,15 +203,29 @@ export default function ECGVisualizer(){
     ctx.shadowBlur = 6
     ctx.beginPath()
     let x = xOffset
-    for(let s=0;s<samples;s++){
-      const idx = (writeIndexRef.current + s) % samples
-      const mv = bufferRef.current[leadIdx][idx] || 0
-      const mm = mv * DEFAULT_MM_PER_MV * gain
-      const y = baselineY - mm * pixelsPerMm
-      if(s===0) ctx.moveTo(x,y)
-      else ctx.lineTo(x,y)
-      x += xStep
-      if (x > xOffset + width + 2) break
+    if (samplesArr && Array.isArray(samplesArr)){
+      // draw from frozen array sequentially
+      for (let s=0; s<samplesArr.length; s++){
+        const mv = samplesArr[s] || 0
+        const mm = mv * DEFAULT_MM_PER_MV * gain
+        const y = baselineY - mm * pixelsPerMm
+        if (s===0) ctx.moveTo(x,y)
+        else ctx.lineTo(x,y)
+        x += xStep
+        if (x > xOffset + width + 2) break
+      }
+    } else {
+      // live ring buffer draw
+      for(let s=0;s<samples;s++){
+        const idx = (writeIndexRef.current + s) % samples
+        const mv = bufferRef.current[leadIdx][idx] || 0
+        const mm = mv * DEFAULT_MM_PER_MV * gain
+        const y = baselineY - mm * pixelsPerMm
+        if(s===0) ctx.moveTo(x,y)
+        else ctx.lineTo(x,y)
+        x += xStep
+        if (x > xOffset + width + 2) break
+      }
     }
     ctx.stroke()
     ctx.shadowBlur = 0
@@ -270,17 +298,21 @@ export default function ECGVisualizer(){
     // Header with comprehensive info
     ctx.fillStyle = '#000'
     ctx.font = 'bold 18px Arial, Helvetica, sans-serif'
-    const firstLead = data['Lead I'] || data['I'] || data['Lead II'] || data['II'] || data['Lead III'] || data['III']
-    const recordedSeconds = firstLead ? (firstLead.length / sampleRate).toFixed(1) : '0.0'
-    ctx.fillText(`NextECG — 6-Lead ECG Report (${recordedSeconds}s)`, margin, margin + 14)
+  const firstLead = data['Lead I'] || data['I'] || data['Lead II'] || data['II'] || data['Lead III'] || data['III']
+  const recordedSeconds = firstLead ? (firstLead.length / sampleRate).toFixed(1) : '0.0'
+  // If metadata exists, show that this is a 1s excerpt at the 15s mark (or other capture time)
+  const meta = data && data.__meta ? data.__meta : null
+  const headerTitle = meta && meta.excerptSeconds && meta.captureAt ? `NextECG — 6-Lead ECG Report (excerpt ${meta.excerptSeconds}s at ${meta.captureAt}s)` : `NextECG — 6-Lead ECG Report (${recordedSeconds}s)`
+  ctx.fillText(headerTitle, margin, margin + 14)
     
     ctx.font = '12px Arial, Helvetica, sans-serif'
     const dateStr = new Date().toLocaleString()
     ctx.fillText(`Date: ${dateStr}`, margin, margin + 30)
     
-    // Technical parameters
-    ctx.fillText(`Time Domain: 25 mm/s  |  Amplitude: 10 mm/mV  |  Sample Rate: ${sampleRate} Hz`, margin, margin + 44)
-    ctx.fillText(`Frequency Domain: Filter 0.5–40 Hz (Bandpass)  |  Recording: ${recordedSeconds} seconds`, margin, margin + 58)
+  // Technical parameters
+  ctx.fillText(`Time Domain: 25 mm/s  |  Amplitude: 10 mm/mV  |  Sample Rate: ${sampleRate} Hz`, margin, margin + 44)
+  const recordingLabelSeconds = meta && meta.excerptSeconds ? `${meta.excerptSeconds}` : recordedSeconds
+  ctx.fillText(`Frequency Domain: Filter 0.5–40 Hz (Bandpass)  |  Recording: ${recordingLabelSeconds} seconds`, margin, margin + 58)
 
     // Calibration pulse 1mV
     const calX = margin
@@ -310,19 +342,55 @@ export default function ECGVisualizer(){
       ctx.fillText(`${s}s`, x + 3, margin + headerH - 14)
     }
 
-    // Lead layout - all 6 leads clearly labeled
-    const leadOrder = ['Lead I', 'Lead II', 'Lead III', 'aVR', 'aVL', 'aVF']
-    const leadKeys = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF']
+    // Normalize/ensure leads: prefer 'Lead I' keys but accept multiple variants.
+    const shortKeys = ['I', 'II', 'III', 'aVR', 'aVL', 'aVF']
+    const longLabels = ['Lead I','Lead II','Lead III','aVR','aVL','aVF']
+    // Build normalized map
+    const norm = {}
+    function findSamples(variants){ for (const v of variants){ if (data && data[v]) return data[v] } return null }
+    for (let i=0;i<shortKeys.length;i++){
+      const short = shortKeys[i]
+      const long = longLabels[i]
+      norm[short] = findSamples([long, short, `Lead ${short}`])
+    }
+    // Derive missing leads if requested
+    if (advancedReport) {
+      if (!norm['III'] && norm['I'] && norm['II']){
+        const a = norm['II'], b = norm['I']; const len = Math.min(a.length, b.length); const arr = new Array(len)
+        for (let k=0;k<len;k++) arr[k] = a[k] - b[k]
+        norm['III'] = arr
+      }
+      if ((!norm['aVR'] || !norm['aVL'] || !norm['aVF']) && norm['I'] && norm['II']){
+        const I = norm['I'], II = norm['II']; const len = Math.min(I.length, II.length)
+        const avr = new Array(len), avl = new Array(len), avf = new Array(len)
+        for (let k=0;k<len;k++){ const la=I[k], ll=II[k], ra=0.0; avr[k]=ra-(la+ll)/2; avl[k]=la-(ra+ll)/2; avf[k]=ll-(ra+la)/2 }
+        if (!norm['aVR']) norm['aVR']=avr
+        if (!norm['aVL']) norm['aVL']=avl
+        if (!norm['aVF']) norm['aVF']=avf
+      }
+    }
     const leadHeightMm = 26
     const leadHeight = leadHeightMm * ppm
     const startY = margin + headerH + 5
     const innerWidth = canvas.width - 2*margin
 
-    leadOrder.forEach((leadLabel, idx) => {
-      const yBase = startY + idx * leadHeight + (leadHeight/2)
-      const leadKey = leadKeys[idx]
-      drawReportLeadStrip(ctx, data[leadKey], leadLabel, margin, yBase, innerWidth, ppm)
-    })
+    // draw paired rows: [Lead I | aVL], [Lead II | aVF], [Lead III | aVR]
+    const pairList = [[0,4],[1,5],[2,3]]
+    const gapMm = 6
+    const gapPx = gapMm * ppm
+    const colWidth = Math.floor((innerWidth - gapPx) / 2)
+    for (let row=0; row<pairList.length; row++){
+      const [leftIdx, rightIdx] = pairList[row]
+      const leftShort = shortKeys[leftIdx]
+      const rightShort = shortKeys[rightIdx]
+      const leftLabel = longLabels[leftIdx]
+      const rightLabel = longLabels[rightIdx]
+      const yBase = startY + row * leadHeight + (leadHeight/2)
+      const leftX = margin
+      const rightX = margin + colWidth + gapPx
+      drawReportLeadStrip(ctx, norm[leftShort] || null, leftLabel, leftX, yBase, colWidth, ppm)
+      drawReportLeadStrip(ctx, norm[rightShort] || null, rightLabel, rightX, yBase, colWidth, ppm)
+    }
   }
 
   // When report is shown, render into the visible canvas
@@ -403,8 +471,13 @@ export default function ECGVisualizer(){
 
   // connect via Web Serial
   async function connect(){
-    if(!('serial' in navigator)) { alert('Use Chrome or Edge with Web Serial enabled'); return }
+    setConnectError(null)
+    if(!('serial' in navigator)) { setConnectError('Web Serial API not available in this browser. Use Chrome or Edge.'); alert('Use Chrome or Edge with Web Serial enabled'); return }
     try{
+      // Helpful diagnostic: list already-authorized ports
+      if (navigator.serial.getPorts) {
+        try { const existing = await navigator.serial.getPorts(); console.debug('Previously authorized serial ports:', existing.length) } catch(e){ console.debug('getPorts failed', e) }
+      }
       const port = await navigator.serial.requestPort()
       await port.open({ baudRate: 115200 })
       portRef.current = port
@@ -485,9 +558,16 @@ export default function ECGVisualizer(){
               recordRef.current.data[ln].push(mvs[idx])
             })
             recordRef.current.count += 1
-            const duration = recordRef.current.count / sampleRateRef.current
+            // Use timestamp-based duration for robustness
+            const nowSec = Date.now()/1000
+            const start = recordRef.current.startTime || nowSec
+            const duration = nowSec - start
             setRecordingProgress(duration)
-            // No auto-stop - user must click Stop button
+            // Auto-stop when we reach CAPTURE_SECONDS seconds (guard to call once)
+            if (duration >= CAPTURE_SECONDS && !autoStopTriggeredRef.current) {
+              autoStopTriggeredRef.current = true
+              try { stopRecording({ auto: true, captureSecond: CAPTURE_SECONDS }) } catch(e){ console.warn('auto-stop failed', e) }
+            }
           }
 
           const samples = bufferRef.current[0]?.length || Math.max(1,Math.floor(sampleRate*secondsWindow))
@@ -499,7 +579,13 @@ export default function ECGVisualizer(){
           writeIndexRef.current = (writeIndexRef.current + 1) % samples
         }
       }
-    }catch(err){ console.error(err); alert('Connection failed: '+err); setConnected(false) }
+    }catch(err){
+      console.error('Serial connect error', err)
+      const msg = err && err.message ? err.message : String(err)
+      setConnectError(msg)
+      alert('Connection failed: '+msg)
+      setConnected(false)
+    }
   }
 
   async function disconnect(){
@@ -518,25 +604,123 @@ export default function ECGVisualizer(){
       return
     }
     // initialize ref buffers for each lead
-    recordRef.current = { active:true, data:{}, count:0 }
+    recordRef.current = { active:true, data:{}, count:0, startTime: Date.now()/1000 }
+  autoStopTriggeredRef.current = false
+  manualStopRef.current = false
     leads.forEach(ln => { recordRef.current.data[ln] = [] })
+  // Clear any frozen display so live view resumes and allow incoming data
+  frozenBufferRef.current = null
+  freezeDisplayRef.current = false
     setRecordingProgress(0)
     setIsRecording(true)
     setShowReport(false)
   }
 
-  function stopRecording() {
-    if (!isRecording) return
-    
+  function stopRecording(options = { auto: false, captureSecond: CAPTURE_SECONDS }) {
+    const { auto, captureSecond } = options
+    // If not recording and this isn't a forced auto-stop, ignore
+    if (!isRecording && !auto && !recordRef.current.active) return
+
+    // deactivate recording immediately
     recordRef.current.active = false
     setIsRecording(false)
-    
-    // Snapshot data
+
+    // Prepare snapshot object
     const snap = {}
-    leads.forEach(ln => { snap[ln] = recordRef.current.data[ln].slice() })
-    setRecordedData(snap)
-    
-    // Start 10-second wait
+
+    if (auto) {
+      // For auto-stop we want the 1-second excerpt that ends at captureSecond (e.g., 14s..15s)
+      const oneSecondSamples = Math.floor(1 * sampleRateRef.current)
+      const sampleIndexEnd = Math.floor((captureSecond) * sampleRateRef.current)
+      leads.forEach(ln => {
+        const arr = recordRef.current.data[ln] || []
+        // preferred: slice from (end - oneSecondSamples) .. end, but guard against short arrays
+        let startIdx = sampleIndexEnd - oneSecondSamples
+        if (startIdx < 0) startIdx = 0
+        // If we don't yet have samples up to sampleIndexEnd (e.g., timing jitter), fall back to last oneSecondSamples
+        if (arr.length >= sampleIndexEnd) {
+          snap[ln] = arr.slice(Math.max(0, startIdx), Math.min(sampleIndexEnd, arr.length))
+        } else {
+          snap[ln] = arr.length > oneSecondSamples ? arr.slice(-oneSecondSamples) : arr.slice()
+        }
+      })
+      // embed metadata so report can label the excerpt correctly
+      snap.__meta = { excerptSeconds: 1, captureAt: captureSecond, sampleIndexEnd }
+    } else {
+      // user-initiated stop: keep entire captured buffer
+      leads.forEach(ln => { snap[ln] = (recordRef.current.data[ln] || []).slice() })
+      snap.__meta = { excerptSeconds: (snap[leads[0]]?.length || 0) / sampleRateRef.current, captureAt: null }
+    }
+
+    // Normalize snap into short keys and long keys and derive missing leads so report is consistent
+    const normalized = {}
+    // helper to set both short and long labels
+    function setLead(short, long, arr){ if(!arr) arr = null; normalized[short] = arr; normalized[long] = arr }
+
+    // populate from snap which uses long labels (e.g., 'Lead I')
+    leads.forEach((longLabel, idx) => {
+      const short = ['I','II','III','aVR','aVL','aVF'][idx]
+      setLead(short, longLabel, snap[longLabel] || snap[short] || snap[`Lead ${short}`])
+    })
+
+    // If advancedReport, derive missing leads from I & II
+    if (advancedReport) {
+      const I = normalized['I']
+      const II = normalized['II']
+      if ((!normalized['III'] || !normalized['Lead III']) && I && II) {
+        const len = Math.min(I.length, II.length)
+        const arr = new Array(len)
+        for (let k=0;k<len;k++) arr[k] = II[k] - I[k]
+        setLead('III','Lead III', arr)
+      }
+      if ((!normalized['aVR'] || !normalized['aVL'] || !normalized['aVF']) && I && II) {
+        const len = Math.min(I.length, II.length)
+        const avr = new Array(len), avl = new Array(len), avf = new Array(len)
+        for (let k=0;k<len;k++){
+          const la = I[k]; const ll = II[k]; const ra = 0.0
+          avr[k] = ra - (la + ll)/2
+          avl[k] = la - (ra + ll)/2
+          avf[k] = ll - (ra + la)/2
+        }
+        setLead('aVR','aVR', avr)
+        setLead('aVL','aVL', avl)
+        setLead('aVF','aVF', avf)
+      }
+    }
+
+  setRecordedData(normalized)
+
+    // If this was a manual stop (not auto), snapshot the current live ring buffer
+    // and freeze the on-screen display so the user sees the exact frozen waveform.
+    if (!auto) {
+      try {
+        const samples = bufferRef.current[0]?.length || 1
+        const end = writeIndexRef.current
+        const snapBuf = bufferRef.current.map(arr => {
+          const out = new Array(samples)
+          for (let s = 0; s < samples; s++) {
+            const idx = (end + s) % samples
+            out[s] = arr[idx]
+          }
+          return out
+        })
+        frozenBufferRef.current = snapBuf
+        freezeDisplayRef.current = true
+        console.debug('stopRecording: froze display snapshot (manual stop)', { samples, end })
+      } catch (e) {
+        console.warn('stopRecording: failed to create frozen snapshot', e)
+        frozenBufferRef.current = null
+        freezeDisplayRef.current = false
+      }
+      // mark manual stop so auto-start won't run
+      manualStopRef.current = true
+    } else {
+      // For auto-stops we do not freeze the live display by default
+      frozenBufferRef.current = null
+      freezeDisplayRef.current = false
+    }
+
+    // Start wait period (processing)
     setIsWaiting(true)
     setWaitProgress(0)
   }
@@ -554,7 +738,7 @@ export default function ECGVisualizer(){
         clearInterval(interval)
         setIsWaiting(false)
         setWaitProgress(0)
-        // Report is now ready - user can view it
+          // Report is now ready - user may open it via the 'View Report' button (no auto-popup)
       }
     }, 100)
     
@@ -563,7 +747,7 @@ export default function ECGVisualizer(){
 
   // Auto-start capture after calibration completes
   useEffect(() => {
-    if (connected && !isCalibrating && !isRecording && !showReport && !isWaiting) {
+    if (connected && !isCalibrating && !isRecording && !showReport && !isWaiting && !manualStopRef.current) {
       const timer = setTimeout(() => {
         startRecording()
       }, 500) // Small delay to ensure calibration state is stable
@@ -621,10 +805,10 @@ export default function ECGVisualizer(){
               }}>
                 💾 Download Report
               </button>
-              <button onClick={()=>{ setShowReport(false); if(connected && !isCalibrating) startRecording() }} className="btn" style={{ 
+              <button onClick={()=>{ setShowReport(false); if(connected && !isCalibrating) { setRecordedData(null); startRecording() } }} className="btn" style={{ 
                 background: '#41ff8b', color: '#0b0f14', fontWeight: 'bold', padding: '12px 24px'
               }}>
-                🔁 New 10s Capture
+                🔁 Restart 15s Capture
               </button>
               <button onClick={()=>setShowReport(false)} className="btn" style={{ padding: '12px 24px' }}>
                 ✕ Close
@@ -639,11 +823,28 @@ export default function ECGVisualizer(){
           {!connected ? (
             <button className="btn" onClick={connect}>🔌 Connect Device</button>
           ) : (
-            <button className="btn" onClick={disconnect}>⛔ Disconnect</button>
+            <>
+              <button className="btn" onClick={disconnect}>⛔ Disconnect</button>
+              {!isRecording && !isCalibrating && (
+                <button className="btn" onClick={startRecording} style={{background:'#00d9ff',color:'#071422',fontWeight:'700',marginLeft:8}}>▶ Start Recording</button>
+              )}
+            </>
+          )}
+          {connectError && (
+            <div style={{color:'#ffb4b4',background:'#3b1212',padding:'8px 12px',borderRadius:6,marginLeft:8}}>
+              <div style={{fontWeight:700}}>Serial error</div>
+              <div style={{fontSize:12,opacity:0.9,whiteSpace:'pre-wrap'}}>{connectError}</div>
+              <div style={{marginTop:8}}>
+                <button className="btn" onClick={connect} style={{marginRight:8}}>Retry</button>
+                <button className="btn" onClick={async ()=>{
+                  try{ const ports = await navigator.serial.getPorts(); alert('Known ports: '+ports.length) }catch(e){ alert('getPorts failed: '+e) }
+                }}>List Ports</button>
+              </div>
+            </div>
           )}
           
           {isRecording && (
-            <button className="btn" onClick={stopRecording} style={{background:'#ef4444',color:'#fff',fontWeight:'bold'}}>
+            <button className="btn" onClick={()=>stopRecording()} style={{background:'#ef4444',color:'#fff',fontWeight:'bold'}}>
               ⏹ Stop Recording
             </button>
           )}
@@ -661,6 +862,10 @@ export default function ECGVisualizer(){
           <label style={{display:'flex',alignItems:'center',gap:6}}>
             <input type="checkbox" checked={filterOn} onChange={e=>setFilterOn(e.target.checked)} />
             <span>Filter 0.5–40 Hz</span>
+          </label>
+          <label style={{display:'flex',alignItems:'center',gap:6}} title="Try to ensure all 6 leads appear on the printed report (derive missing leads from I & II)">
+            <input type="checkbox" checked={advancedReport} onChange={e=>setAdvancedReport(e.target.checked)} />
+            <span>Advanced Report (force 6 leads)</span>
           </label>
           <button className="btn" onClick={exportPNG}>📷 Export Live PNG</button>
           {recordedData && (
